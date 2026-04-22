@@ -14,24 +14,31 @@ const QUEUE       = 'orders';
 
 let db, channel;
 
-async function init() {
-  const mongoClient = new MongoClient(MONGO_URL);
-  await mongoClient.connect();
-  db = mongoClient.db(DB_NAME);
-
-  // Retry RabbitMQ connection on startup
-  for (let i = 0; i < 10; i++) {
+/** RabbitMQ in background so /health is available while the broker comes up (avoids init-container deadlocks). */
+async function connectRabbitBackground() {
+  let attempt = 0;
+  while (true) {
     try {
       const conn = await amqp.connect(RABBITMQ_URL);
       channel = await conn.createChannel();
       await channel.assertQueue(QUEUE, { durable: true });
       console.log('Connected to RabbitMQ');
-      break;
-    } catch {
-      console.log(`RabbitMQ not ready, retrying (${i + 1}/10)...`);
+      return;
+    } catch (e) {
+      attempt += 1;
+      console.log(`RabbitMQ not ready (${attempt}), retrying in 3s...`, e.message || e);
       await new Promise(r => setTimeout(r, 3000));
     }
   }
+}
+
+async function init() {
+  const mongoClient = new MongoClient(MONGO_URL);
+  await mongoClient.connect();
+  db = mongoClient.db(DB_NAME);
+
+  app.listen(3002, () => console.log('Order Service running on port 3002'));
+  connectRabbitBackground();
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
@@ -42,6 +49,9 @@ app.get('/orders', async (_req, res) => {
 });
 
 app.post('/orders', async (req, res) => {
+  if (!channel) {
+    return res.status(503).json({ error: 'Order queue unavailable' });
+  }
   const order = { ...req.body, status: 'pending', created_at: new Date() };
   const result = await db.collection('orders').insertOne(order);
   const id = result.insertedId.toString();
@@ -57,4 +67,7 @@ app.put('/orders/:id', async (req, res) => {
   res.json({ updated: req.params.id });
 });
 
-init().then(() => app.listen(3002, () => console.log('Order Service running on port 3002')));
+init().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
